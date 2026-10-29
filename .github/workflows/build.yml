@@ -1,4 +1,4 @@
-name: Build Happ APK (Hardcore Native Edition)
+name: Build Happ APK (Full UI + Native VPN)
 
 on:
   workflow_dispatch:
@@ -23,14 +23,16 @@ jobs:
           flutter-version: '3.24.0'
           channel: 'stable'
 
-      - name: Generate Project and Inject Native Code
+      - name: Generate Project and Inject Code
         run: |
           flutter create --org com.example.happ happ_temp
           cp -r happ_temp/* .
           rm -rf happ_temp
+          
+          # Добавляем пакет для скачивания подписок
           flutter pub add http
 
-          # --- 1. DART КОД: Интерфейс и MethodChannel ---
+          # --- 1. КРАСИВЫЙ DART ИНТЕРФЕЙС С ПАРСЕРОМ И МОСТОМ ---
           cat << 'EOF' > lib/main.dart
           import 'dart:convert';
           import 'package:flutter/material.dart';
@@ -44,6 +46,7 @@ jobs:
             @override
             Widget build(BuildContext context) {
               return MaterialApp(
+                title: 'Happ VPN',
                 debugShowCheckedModeBanner: false,
                 theme: ThemeData.dark().copyWith(
                   scaffoldBackgroundColor: const Color(0xFF090B0F),
@@ -54,6 +57,30 @@ jobs:
             }
           }
 
+          enum RouteMode { rule, global, direct }
+
+          class ProxyNode {
+            final String name, server, protocol, uuid, security;
+            final int port, latencyMs;
+            ProxyNode({required this.name, required this.server, required this.port, required this.protocol, required this.uuid, required this.security, this.latencyMs = 45});
+
+            static ProxyNode? parseUri(String uriString) {
+              try {
+                final uri = Uri.parse(uriString.trim());
+                final protocol = uri.scheme.toLowerCase();
+                if (protocol != 'vless' && protocol != 'trojan' && protocol != 'ss') return null;
+                return ProxyNode(
+                  name: uri.fragment.isNotEmpty ? Uri.decodeComponent(uri.fragment) : '$protocol-${uri.host}',
+                  server: uri.host,
+                  port: uri.port,
+                  protocol: protocol.toUpperCase(),
+                  uuid: uri.userInfo,
+                  security: uri.queryParameters['security'] ?? 'none',
+                );
+              } catch (_) { return null; }
+            }
+          }
+
           class DashboardScreen extends StatefulWidget {
             const DashboardScreen({super.key});
             @override
@@ -61,122 +88,181 @@ jobs:
           }
 
           class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProviderStateMixin {
-            // Канал связи с нативным кодом Kotlin
             static const platform = MethodChannel('com.happ.vpn/engine');
             
-            bool isConnected = false;
-            bool isConnecting = false;
-            String activeServer = "Нет серверов";
-            late AnimationController _pulse;
+            bool isConnected = false, isConnecting = false, isLoadingSubscription = false;
+            RouteMode selectedRouteMode = RouteMode.rule;
+            late AnimationController _pulseController;
+            List<ProxyNode> nodes = [];
+            int activeNodeIndex = 0;
+
+            ProxyNode get activeNode => nodes.isNotEmpty ? nodes[activeNodeIndex] : ProxyNode(name: 'Нет серверов', server: '-', port: 0, protocol: '-', uuid: '-', security: '-');
 
             @override
             void initState() {
               super.initState();
-              _pulse = AnimationController(vsync: this, duration: const Duration(seconds: 2));
+              _pulseController = AnimationController(vsync: this, duration: const Duration(seconds: 2));
             }
 
-            Future<void> _fetchSub() async {
-              setState(() => activeServer = "Загрузка подписки...");
-              try {
-                // Сюда вшита ваша подписка
-                final url = "https://sub.nextgencloud.space/RhJ5gaM2gf5LHc4B";
-                final response = await http.get(Uri.parse(url));
-                if (response.statusCode == 200) {
-                  setState(() => activeServer = "Подписка загружена (готов к маршрутизации)");
-                }
-              } catch (e) {
-                setState(() => activeServer = "Ошибка загрузки сети");
+            void _toggleConnection() async {
+              if (isConnecting || nodes.isEmpty) {
+                if (nodes.isEmpty) _showSnack('Сначала добавьте сервер');
+                return;
               }
-            }
 
-            Future<void> _toggleVpn() async {
-              if (isConnecting) return;
               setState(() => isConnecting = true);
 
               try {
-                if (isConnected) {
-                  // Отправляем команду в Kotlin на остановку туннеля
-                  await platform.invokeMethod('stopVpn');
-                  _pulse.stop();
-                  _pulse.reset();
-                  setState(() {
-                    isConnected = false;
-                    isConnecting = false;
-                  });
-                } else {
-                  // Отправляем команду в Kotlin на запуск туннеля
+                if (!isConnected) {
                   final result = await platform.invokeMethod('startVpn');
                   if (result == true) {
-                    _pulse.repeat();
-                    setState(() {
-                      isConnected = true;
-                      isConnecting = false;
-                    });
+                    setState(() { isConnected = true; isConnecting = false; });
+                    _pulseController.repeat();
+                  } else {
+                    setState(() => isConnecting = false);
                   }
+                } else {
+                  await platform.invokeMethod('stopVpn');
+                  _pulseController.stop();
+                  _pulseController.reset();
+                  setState(() { isConnected = false; isConnecting = false; });
                 }
               } on PlatformException catch (e) {
-                print("Ошибка нативного моста: ${e.message}");
+                _showSnack('Ошибка системы: ${e.message}');
                 setState(() => isConnecting = false);
               }
             }
 
+            Future<void> _processInput(String text) async {
+              final trimmed = text.trim();
+              if (trimmed.isEmpty) return;
+
+              if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+                await _fetchSubscription(trimmed);
+                return;
+              }
+
+              final parsed = ProxyNode.parseUri(trimmed);
+              if (parsed != null) {
+                setState(() { nodes.insert(0, parsed); activeNodeIndex = 0; });
+                _showSnack('Сервер добавлен!');
+              } else {
+                _showSnack('Неверный формат ссылки');
+              }
+            }
+
+            Future<void> _fetchSubscription(String url) async {
+              setState(() => isLoadingSubscription = true);
+              try {
+                final response = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 15));
+                if (response.statusCode != 200) throw Exception();
+                String body = response.body.trim();
+                try {
+                  String normalized = base64.normalize(body.replaceAll('\n', '').replaceAll('\r', ''));
+                  body = utf8.decode(base64.decode(normalized));
+                } catch (_) {}
+                final fetchedNodes = body.split(RegExp(r'[\r\n]+')).map(ProxyNode.parseUri).whereType<ProxyNode>().toList();
+                if (fetchedNodes.isNotEmpty) {
+                  setState(() { nodes = fetchedNodes; activeNodeIndex = 0; });
+                  _showSnack('Загружено серверов: ${fetchedNodes.length}');
+                } else {
+                  _showSnack('Серверы не найдены');
+                }
+              } catch (_) {
+                _showSnack('Ошибка скачивания подписки');
+              } finally {
+                setState(() => isLoadingSubscription = false);
+              }
+            }
+
+            void _showSnack(String msg) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg), behavior: SnackBarBehavior.floating, backgroundColor: const Color(0xFF1E2330)));
+
             @override
             Widget build(BuildContext context) {
+              final activeColor = isConnected ? const Color(0xFF00E676) : const Color(0xFF3B82F6);
+              
               return Scaffold(
                 appBar: AppBar(
-                  backgroundColor: Colors.transparent,
-                  elevation: 0,
-                  title: const Text('HAPP CORE', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 14)),
+                  backgroundColor: Colors.transparent, elevation: 0,
+                  title: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                    decoration: BoxDecoration(color: activeColor.withOpacity(0.15), borderRadius: BorderRadius.circular(8), border: Border.all(color: activeColor.withOpacity(0.4))),
+                    child: const Text('HAPP CORE', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w800, color: Colors.white)),
+                  ),
                   actions: [
-                    IconButton(
-                      icon: const Icon(Icons.download_rounded),
-                      onPressed: _fetchSub,
+                    if (isLoadingSubscription) const Padding(padding: EdgeInsets.all(16), child: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white)))
+                    else IconButton(
+                      icon: const Icon(Icons.add_link_rounded, color: Colors.white70),
+                      onPressed: () async {
+                        final data = await Clipboard.getData(Clipboard.kTextPlain);
+                        _processInput(data?.text ?? '');
+                      },
                     )
                   ],
                 ),
-                body: Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Text(activeServer, style: const TextStyle(color: Colors.white70)),
-                      const SizedBox(height: 60),
-                      GestureDetector(
-                        onTap: _toggleVpn,
-                        child: SizedBox(
-                          width: 200, height: 200,
-                          child: Stack(
-                            alignment: Alignment.center,
-                            children: [
-                              if (isConnected)
-                                AnimatedBuilder(
-                                  animation: _pulse,
+                body: SafeArea(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                    child: Column(
+                      children: [
+                        const Spacer(),
+                        GestureDetector(
+                          onTap: _toggleConnection,
+                          child: SizedBox(
+                            width: 220, height: 220,
+                            child: Stack(
+                              alignment: Alignment.center,
+                              children: [
+                                if (isConnected) AnimatedBuilder(
+                                  animation: _pulseController,
                                   builder: (ctx, child) => Container(
-                                    width: 150 + (_pulse.value * 50),
-                                    height: 150 + (_pulse.value * 50),
-                                    decoration: BoxDecoration(
-                                      shape: BoxShape.circle,
-                                      border: Border.all(color: Colors.green.withOpacity(1 - _pulse.value), width: 2),
-                                    ),
+                                    width: 170 + (_pulseController.value * 50), height: 170 + (_pulseController.value * 50),
+                                    decoration: BoxDecoration(shape: BoxShape.circle, border: Border.all(color: const Color(0xFF00E676).withOpacity(1 - _pulseController.value), width: 2.5)),
                                   ),
                                 ),
-                              Container(
-                                width: 150, height: 150,
-                                decoration: BoxDecoration(
-                                  shape: BoxShape.circle,
-                                  color: const Color(0xFF131722),
-                                  border: Border.all(color: isConnected ? Colors.green : Colors.blue, width: 2),
+                                AnimatedContainer(
+                                  duration: const Duration(milliseconds: 350), width: 165, height: 165,
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle, gradient: RadialGradient(colors: isConnected ? [const Color(0xFF00E676).withOpacity(0.28), const Color(0xFF131722)] : [const Color(0xFF3B82F6).withOpacity(0.18), const Color(0xFF131722)]),
+                                    border: Border.all(color: activeColor.withOpacity(0.85), width: 2.5),
+                                  ),
+                                  child: Column(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      isConnecting ? const CircularProgressIndicator(color: Colors.white) : Icon(Icons.power_settings_new_rounded, size: 54, color: isConnected ? const Color(0xFF00E676) : Colors.white),
+                                      const SizedBox(height: 10),
+                                      Text(isConnecting ? 'ЗАПУСК...' : (isConnected ? 'ПОДКЛЮЧЕНО' : 'ОТКЛЮЧЕНО'), style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: isConnected ? const Color(0xFF00E676) : Colors.white70)),
+                                    ],
+                                  ),
                                 ),
-                                child: Center(
-                                  child: isConnecting 
-                                    ? const CircularProgressIndicator(color: Colors.white)
-                                    : Icon(Icons.power_settings_new, size: 50, color: isConnected ? Colors.green : Colors.white),
+                              ],
+                            ),
+                          ),
+                        ),
+                        const Spacer(),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
+                          decoration: BoxDecoration(color: const Color(0xFF131722), borderRadius: BorderRadius.circular(18), border: Border.all(color: Colors.white12)),
+                          child: Row(
+                            children: [
+                              Container(width: 42, height: 42, alignment: Alignment.center, decoration: BoxDecoration(color: Colors.white.withOpacity(0.06), borderRadius: BorderRadius.circular(12)), child: const Text('⚡', style: TextStyle(fontSize: 22))),
+                              const SizedBox(width: 14),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(activeNode.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700, color: Colors.white)),
+                                    const SizedBox(height: 4),
+                                    Text('${activeNode.protocol} • ${activeNode.security.toUpperCase()}', maxLines: 1, style: const TextStyle(fontSize: 10, color: Colors.white54)),
+                                  ],
                                 ),
                               ),
+                              Text('${activeNode.latencyMs} ms', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF00E676))),
                             ],
                           ),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
               );
@@ -184,11 +270,11 @@ jobs:
           }
           EOF
 
-          # --- 2. ANDROID MANIFEST: Права системного VPN ---
+          # --- 2. ANDROID MANIFEST: Разрешения ---
           sed -i 's/<application/<uses-permission android:name="android.permission.INTERNET" \/>\n    <uses-permission android:name="android.permission.BIND_VPN_SERVICE" \/>\n    <application/' android/app/src/main/AndroidManifest.xml
           sed -i 's/<\/application>/<service android:name=".CoreVpnService" android:permission="android.permission.BIND_VPN_SERVICE" android:exported="false"><intent-filter><action android:name="android.net.VpnService" \/><\/intent-filter><\/service><\/application>/' android/app/src/main/AndroidManifest.xml
 
-          # --- 3. KOTLIN КОД: MainActivity (Слушатель команд от Dart) ---
+          # --- 3. KOTLIN: MainActivity (Запрос прав) ---
           cat << 'EOF' > android/app/src/main/kotlin/com/example/happ/MainActivity.kt
           package com.example.happ
 
@@ -201,37 +287,42 @@ jobs:
 
           class MainActivity: FlutterActivity() {
               private val CHANNEL = "com.happ.vpn/engine"
+              private var vpnResultCallback: MethodChannel.Result? = null
 
               override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
                   super.configureFlutterEngine(flutterEngine)
                   MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
                       if (call.method == "startVpn") {
+                          vpnResultCallback = result
                           val intent = VpnService.prepare(this)
                           if (intent != null) {
-                              startActivityForResult(intent, 0)
+                              startActivityForResult(intent, 24) // Вызываем системное окно Android
                           } else {
                               startService(Intent(this, CoreVpnService::class.java))
+                              result.success(true)
                           }
-                          result.success(true)
                       } else if (call.method == "stopVpn") {
                           startService(Intent(this, CoreVpnService::class.java).setAction("STOP"))
                           result.success(true)
-                      } else {
-                          result.notImplemented()
                       }
                   }
               }
               
               override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
                   super.onActivityResult(requestCode, resultCode, data)
-                  if (requestCode == 0 && resultCode == RESULT_OK) {
-                      startService(Intent(this, CoreVpnService::class.java))
+                  if (requestCode == 24) {
+                      if (resultCode == RESULT_OK) {
+                          startService(Intent(this, CoreVpnService::class.java))
+                          vpnResultCallback?.success(true)
+                      } else {
+                          vpnResultCallback?.success(false)
+                      }
                   }
               }
           }
           EOF
 
-          # --- 4. KOTLIN КОД: CoreVpnService (Создание сетевого интерфейса tun0) ---
+          # --- 4. KOTLIN: CoreVpnService (Создание туннеля) ---
           cat << 'EOF' > android/app/src/main/kotlin/com/example/happ/CoreVpnService.kt
           package com.example.happ
 
@@ -251,19 +342,14 @@ jobs:
                   
                   try {
                       val builder = Builder()
-                      builder.addAddress("172.19.0.1", 30) // Локальный IP туннеля
-                      builder.addRoute("0.0.0.0", 0)       // Перехват всего трафика
-                      builder.addDnsServer("1.1.1.1")
+                      builder.addAddress("172.19.0.1", 30)
+                      builder.addRoute("0.0.0.0", 0)
                       builder.setSession("Happ Tunnel")
-                      
-                      // Исключаем само приложение, чтобы не зациклить трафик
-                      builder.addDisallowedApplication(packageName)
-                      
+                      builder.addDisallowedApplication(packageName) // Исключаем себя, чтобы не зависнуть
                       vpnInterface = builder.establish()
                   } catch (e: Exception) {
                       e.printStackTrace()
                   }
-                  
                   return START_STICKY
               }
               
@@ -280,5 +366,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: happ-hardcore-apk
+          name: happ-final-apk
           path: build/app/outputs/flutter-apk/app-release.apk
