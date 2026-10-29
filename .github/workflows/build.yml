@@ -1,4 +1,4 @@
-name: Build Happ APK
+name: Build Happ APK (Hardcore Native Edition)
 
 on:
   workflow_dispatch:
@@ -23,32 +23,27 @@ jobs:
           flutter-version: '3.24.0'
           channel: 'stable'
 
-      - name: Generate Flutter Project and Inject Code
+      - name: Generate Project and Inject Native Code
         run: |
           flutter create --org com.example.happ happ_temp
           cp -r happ_temp/* .
           rm -rf happ_temp
-
-          # Добавляем пакет http для скачивания подписок
           flutter pub add http
 
+          # --- 1. DART КОД: Интерфейс и MethodChannel ---
           cat << 'EOF' > lib/main.dart
           import 'dart:convert';
           import 'package:flutter/material.dart';
           import 'package:flutter/services.dart';
           import 'package:http/http.dart' as http;
 
-          void main() {
-            runApp(const HappApp());
-          }
+          void main() => runApp(const HappApp());
 
           class HappApp extends StatelessWidget {
             const HappApp({super.key});
-
             @override
             Widget build(BuildContext context) {
               return MaterialApp(
-                title: 'Happ VPN',
                 debugShowCheckedModeBanner: false,
                 theme: ThemeData.dark().copyWith(
                   scaffoldBackgroundColor: const Color(0xFF090B0F),
@@ -59,689 +54,223 @@ jobs:
             }
           }
 
-          enum RouteMode { rule, global, direct }
-
-          class ProxyNode {
-            final String id;
-            final String name;
-            final String server;
-            final int port;
-            final String protocol;
-            final String uuid;
-            final String security;
-            final String? sni;
-            final String? pbk;
-            final String? sid;
-            int latencyMs;
-
-            ProxyNode({
-              required this.id,
-              required this.name,
-              required this.server,
-              required this.port,
-              required this.protocol,
-              required this.uuid,
-              this.security = 'none',
-              this.sni,
-              this.pbk,
-              this.sid,
-              this.latencyMs = 45,
-            });
-
-            static ProxyNode? parseUri(String uriString) {
-              try {
-                final trimmed = uriString.trim();
-                final uri = Uri.parse(trimmed);
-                final protocol = uri.scheme.toLowerCase();
-
-                if (protocol != 'vless' && protocol != 'trojan' && protocol != 'ss') {
-                  return null;
-                }
-
-                final uuid = uri.userInfo;
-                final server = uri.host;
-                final port = uri.port;
-                final queryParams = uri.queryParameters;
-
-                final rawFragment = uri.fragment;
-                final name = rawFragment.isNotEmpty
-                    ? Uri.decodeComponent(rawFragment)
-                    : '$protocol-$server:$port';
-
-                return ProxyNode(
-                  id: DateTime.now().microsecondsSinceEpoch.toString(),
-                  name: name,
-                  server: server,
-                  port: port,
-                  protocol: protocol.toUpperCase(),
-                  uuid: uuid,
-                  security: queryParams['security'] ?? 'none',
-                  sni: queryParams['sni'],
-                  pbk: queryParams['pbk'],
-                  sid: queryParams['sid'],
-                );
-              } catch (_) {
-                return null;
-              }
-            }
-          }
-
           class DashboardScreen extends StatefulWidget {
             const DashboardScreen({super.key});
-
             @override
             State<DashboardScreen> createState() => _DashboardScreenState();
           }
 
-          class _DashboardScreenState extends State<DashboardScreen>
-              with SingleTickerProviderStateMixin {
+          class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProviderStateMixin {
+            // Канал связи с нативным кодом Kotlin
+            static const platform = MethodChannel('com.happ.vpn/engine');
+            
             bool isConnected = false;
             bool isConnecting = false;
-            bool isLoadingSubscription = false;
-            RouteMode selectedRouteMode = RouteMode.rule;
-            late AnimationController _pulseController;
-
-            List<ProxyNode> nodes = [
-              ProxyNode(
-                id: '1',
-                name: '🇩🇪 Frankfurt • Reality XTLS',
-                server: 'de-01.edge-node.net',
-                port: 443,
-                protocol: 'VLESS',
-                uuid: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
-                security: 'reality',
-                latencyMs: 42,
-              )
-            ];
-
-            int activeNodeIndex = 0;
-
-            ProxyNode get activeNode =>
-                nodes.isNotEmpty ? nodes[activeNodeIndex] : ProxyNode(
-                  id: '0',
-                  name: 'Нет серверов',
-                  server: '-',
-                  port: 0,
-                  protocol: '-',
-                  uuid: '-',
-                );
+            String activeServer = "Нет серверов";
+            late AnimationController _pulse;
 
             @override
             void initState() {
               super.initState();
-              _pulseController = AnimationController(
-                vsync: this,
-                duration: const Duration(seconds: 2),
-              );
+              _pulse = AnimationController(vsync: this, duration: const Duration(seconds: 2));
             }
 
-            @override
-            void dispose() {
-              _pulseController.dispose();
-              super.dispose();
-            }
-
-            void _toggleConnection() async {
-              if (isConnecting) return;
-
-              if (!isConnected) {
-                setState(() => isConnecting = true);
-                await Future.delayed(const Duration(milliseconds: 600));
-                setState(() {
-                  isConnecting = false;
-                  isConnected = true;
-                });
-                _pulseController.repeat();
-              } else {
-                _pulseController.stop();
-                _pulseController.reset();
-                setState(() => isConnected = false);
-              }
-            }
-
-            Future<void> _processInput(String text) async {
-              final trimmed = text.trim();
-              if (trimmed.isEmpty) return;
-
-              // Если вставили ссылку на подписку http/https
-              if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
-                await _fetchSubscription(trimmed);
-                return;
-              }
-
-              // Если вставили одиночный ключ
-              final parsed = ProxyNode.parseUri(trimmed);
-              if (parsed != null) {
-                setState(() {
-                  nodes.insert(0, parsed);
-                  activeNodeIndex = 0;
-                });
-                _showSnack('Сервер добавлен: ${parsed.name}');
-              } else {
-                _showSnack('Не удалось распознать ссылку');
-              }
-            }
-
-            Future<void> _fetchSubscription(String url) async {
-              setState(() => isLoadingSubscription = true);
-              _showSnack('Загрузка подписки...');
-
+            Future<void> _fetchSub() async {
+              setState(() => activeServer = "Загрузка подписки...");
               try {
-                final response = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 15));
-                if (response.statusCode != 200) {
-                  _showSnack('Ошибка сервера: код ${response.statusCode}');
-                  setState(() => isLoadingSubscription = false);
-                  return;
-                }
-
-                String body = response.body.trim();
-
-                // Пробуем раскодировать Base64, если подписка зашифрована
-                try {
-                  String normalized = base64.normalize(body.replaceAll('\n', '').replaceAll('\r', ''));
-                  body = utf8.decode(base64.decode(normalized));
-                } catch (_) {}
-
-                final lines = body.split(RegExp(r'[\r\n]+'));
-                final List<ProxyNode> fetchedNodes = [];
-
-                for (var line in lines) {
-                  final node = ProxyNode.parseUri(line);
-                  if (node != null) {
-                    fetchedNodes.add(node);
-                  }
-                }
-
-                if (fetchedNodes.isNotEmpty) {
-                  setState(() {
-                    nodes = fetchedNodes;
-                    activeNodeIndex = 0;
-                  });
-                  _showSnack('Загружено серверов: ${fetchedNodes.length}');
-                } else {
-                  _showSnack('В подписке не найдено подходящих узлов');
+                // Сюда вшита ваша подписка
+                final url = "https://sub.nextgencloud.space/RhJ5gaM2gf5LHc4B";
+                final response = await http.get(Uri.parse(url));
+                if (response.statusCode == 200) {
+                  setState(() => activeServer = "Подписка загружена (готов к маршрутизации)");
                 }
               } catch (e) {
-                _showSnack('Сбой при загрузке: $e');
-              } finally {
-                setState(() => isLoadingSubscription = false);
+                setState(() => activeServer = "Ошибка загрузки сети");
               }
             }
 
-            Future<void> _importFromClipboard() async {
-              final data = await Clipboard.getData(Clipboard.kTextPlain);
-              final text = data?.text ?? '';
+            Future<void> _toggleVpn() async {
+              if (isConnecting) return;
+              setState(() => isConnecting = true);
 
-              if (text.isEmpty) {
-                _showManualInputDialog();
-              } else {
-                _processInput(text);
+              try {
+                if (isConnected) {
+                  // Отправляем команду в Kotlin на остановку туннеля
+                  await platform.invokeMethod('stopVpn');
+                  _pulse.stop();
+                  _pulse.reset();
+                  setState(() {
+                    isConnected = false;
+                    isConnecting = false;
+                  });
+                } else {
+                  // Отправляем команду в Kotlin на запуск туннеля
+                  final result = await platform.invokeMethod('startVpn');
+                  if (result == true) {
+                    _pulse.repeat();
+                    setState(() {
+                      isConnected = true;
+                      isConnecting = false;
+                    });
+                  }
+                }
+              } on PlatformException catch (e) {
+                print("Ошибка нативного моста: ${e.message}");
+                setState(() => isConnecting = false);
               }
-            }
-
-            void _showManualInputDialog() {
-              final controller = TextEditingController();
-              showDialog(
-                context: context,
-                builder: (ctx) => AlertDialog(
-                  backgroundColor: const Color(0xFF131722),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                  title: const Text('Добавить подписку или ключ', style: TextStyle(color: Colors.white, fontSize: 16)),
-                  content: TextField(
-                    controller: controller,
-                    maxLines: 4,
-                    style: const TextStyle(fontSize: 13, color: Colors.white),
-                    decoration: InputDecoration(
-                      hintText: 'Вставьте ссылку https://... или vless://',
-                      hintStyle: const TextStyle(color: Colors.white38),
-                      filled: true,
-                      fillColor: Colors.black26,
-                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
-                    ),
-                  ),
-                  actions: [
-                    TextButton(
-                      onPressed: () => Navigator.pop(ctx),
-                      child: const Text('Отмена', style: TextStyle(color: Colors.white54)),
-                    ),
-                    ElevatedButton(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF00E676),
-                        foregroundColor: Colors.black,
-                      ),
-                      onPressed: () {
-                        Navigator.pop(ctx);
-                        _processInput(controller.text);
-                      },
-                      child: const Text('Загрузить'),
-                    )
-                  ],
-                ),
-              );
-            }
-
-            void _showNodesListModal() {
-              showModalBottomSheet(
-                context: context,
-                backgroundColor: const Color(0xFF131722),
-                shape: const RoundedRectangleBorder(
-                  borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-                ),
-                builder: (ctx) => StatefulBuilder(
-                  builder: (ctx, setModalState) => Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            Text(
-                              'Серверы (${nodes.length})',
-                              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
-                            ),
-                            IconButton(
-                              icon: const Icon(Icons.add_rounded, color: Color(0xFF00E676)),
-                              onPressed: () {
-                                Navigator.pop(ctx);
-                                _showManualInputDialog();
-                              },
-                            )
-                          ],
-                        ),
-                        const SizedBox(height: 12),
-                        Flexible(
-                          child: ListView.separated(
-                            shrinkWrap: true,
-                            itemCount: nodes.length,
-                            separatorBuilder: (_, __) => const Divider(color: Colors.white10),
-                            itemBuilder: (ctx, index) {
-                              final item = nodes[index];
-                              final isSelected = activeNodeIndex == index;
-                              return ListTile(
-                                contentPadding: EdgeInsets.zero,
-                                leading: Container(
-                                  width: 40,
-                                  height: 40,
-                                  alignment: Alignment.center,
-                                  decoration: BoxDecoration(
-                                    color: Colors.white.withOpacity(0.06),
-                                    borderRadius: BorderRadius.circular(10),
-                                  ),
-                                  child: const Text('🌐', style: TextStyle(fontSize: 20)),
-                                ),
-                                title: Text(
-                                  item.name,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(
-                                    fontSize: 14,
-                                    fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                                    color: isSelected ? const Color(0xFF00E676) : Colors.white,
-                                  ),
-                                ),
-                                subtitle: Text(
-                                  '${item.protocol} • ${item.security.toUpperCase()} • ${item.server}',
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(fontSize: 11, color: Colors.white54),
-                                ),
-                                trailing: isSelected
-                                    ? const Icon(Icons.check_circle_rounded, color: Color(0xFF00E676))
-                                    : null,
-                                onTap: () {
-                                  setState(() => activeNodeIndex = index);
-                                  Navigator.pop(ctx);
-                                },
-                              );
-                            },
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              );
-            }
-
-            void _showSnack(String msg) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: Text(msg),
-                  behavior: SnackBarBehavior.floating,
-                  backgroundColor: const Color(0xFF1E2330),
-                  duration: const Duration(seconds: 3),
-                ),
-              );
             }
 
             @override
             Widget build(BuildContext context) {
-              const bgDark = Color(0xFF090B0F);
-              const cardDark = Color(0xFF131722);
-              const accentGreen = Color(0xFF00E676);
-              const accentBlue = Color(0xFF3B82F6);
-              final activeColor = isConnected ? accentGreen : accentBlue;
-
               return Scaffold(
-                backgroundColor: bgDark,
                 appBar: AppBar(
                   backgroundColor: Colors.transparent,
                   elevation: 0,
-                  title: Row(
+                  title: const Text('HAPP CORE', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 14)),
+                  actions: [
+                    IconButton(
+                      icon: const Icon(Icons.download_rounded),
+                      onPressed: _fetchSub,
+                    )
+                  ],
+                ),
+                body: Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                        decoration: BoxDecoration(
-                          color: activeColor.withOpacity(0.15),
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: activeColor.withOpacity(0.4)),
-                        ),
-                        child: const Text(
-                          'HAPP CORE',
-                          style: TextStyle(
-                            fontSize: 13,
-                            fontWeight: FontWeight.w800,
-                            letterSpacing: 1.4,
-                            color: Colors.white,
+                      Text(activeServer, style: const TextStyle(color: Colors.white70)),
+                      const SizedBox(height: 60),
+                      GestureDetector(
+                        onTap: _toggleVpn,
+                        child: SizedBox(
+                          width: 200, height: 200,
+                          child: Stack(
+                            alignment: Alignment.center,
+                            children: [
+                              if (isConnected)
+                                AnimatedBuilder(
+                                  animation: _pulse,
+                                  builder: (ctx, child) => Container(
+                                    width: 150 + (_pulse.value * 50),
+                                    height: 150 + (_pulse.value * 50),
+                                    decoration: BoxDecoration(
+                                      shape: BoxShape.circle,
+                                      border: Border.all(color: Colors.green.withOpacity(1 - _pulse.value), width: 2),
+                                    ),
+                                  ),
+                                ),
+                              Container(
+                                width: 150, height: 150,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: const Color(0xFF131722),
+                                  border: Border.all(color: isConnected ? Colors.green : Colors.blue, width: 2),
+                                ),
+                                child: Center(
+                                  child: isConnecting 
+                                    ? const CircularProgressIndicator(color: Colors.white)
+                                    : Icon(Icons.power_settings_new, size: 50, color: isConnected ? Colors.green : Colors.white),
+                                ),
+                              ),
+                            ],
                           ),
                         ),
                       ),
-                      const Spacer(),
-                      if (isLoadingSubscription)
-                        const SizedBox(
-                          width: 20,
-                          height: 20,
-                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                        )
-                      else ...[
-                        IconButton(
-                          icon: const Icon(Icons.add_link_rounded, color: Colors.white70),
-                          tooltip: 'Импорт из буфера',
-                          onPressed: _importFromClipboard,
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.edit_note_rounded, color: Colors.white70),
-                          tooltip: 'Ввести ссылку',
-                          onPressed: _showManualInputDialog,
-                        ),
-                      ],
                     ],
                   ),
                 ),
-                body: SafeArea(
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-                    child: Column(
-                      children: [
-                        _buildRouteModeSelector(cardDark, activeColor),
-                        const Spacer(),
-                        GestureDetector(
-                          onTap: _toggleConnection,
-                          child: SizedBox(
-                            width: 220,
-                            height: 220,
-                            child: Stack(
-                              alignment: Alignment.center,
-                              children: [
-                                if (isConnected)
-                                  AnimatedBuilder(
-                                    animation: _pulseController,
-                                    builder: (context, child) {
-                                      return Container(
-                                        width: 170 + (_pulseController.value * 50),
-                                        height: 170 + (_pulseController.value * 50),
-                                        decoration: BoxDecoration(
-                                          shape: BoxShape.circle,
-                                          border: Border.all(
-                                            color: accentGreen.withOpacity(1 - _pulseController.value),
-                                            width: 2.5,
-                                          ),
-                                        ),
-                                      );
-                                    },
-                                  ),
-                                AnimatedContainer(
-                                  duration: const Duration(milliseconds: 350),
-                                  width: 165,
-                                  height: 165,
-                                  decoration: BoxDecoration(
-                                    shape: BoxShape.circle,
-                                    gradient: RadialGradient(
-                                      colors: isConnected
-                                          ? [accentGreen.withOpacity(0.28), cardDark]
-                                          : [accentBlue.withOpacity(0.18), cardDark],
-                                    ),
-                                    boxShadow: [
-                                      BoxShadow(
-                                        color: activeColor.withOpacity(isConnected ? 0.35 : 0.12),
-                                        blurRadius: 32,
-                                        spreadRadius: 4,
-                                      )
-                                    ],
-                                    border: Border.all(
-                                      color: activeColor.withOpacity(0.85),
-                                      width: 2.5,
-                                    ),
-                                  ),
-                                  child: Column(
-                                    mainAxisAlignment: MainAxisAlignment.center,
-                                    children: [
-                                      if (isConnecting)
-                                        const SizedBox(
-                                          width: 36,
-                                          height: 36,
-                                          child: CircularProgressIndicator(
-                                            strokeWidth: 3,
-                                            color: Colors.white,
-                                          ),
-                                        )
-                                      else
-                                        Icon(
-                                          Icons.power_settings_new_rounded,
-                                          size: 54,
-                                          color: isConnected ? accentGreen : Colors.white,
-                                        ),
-                                      const SizedBox(height: 10),
-                                      Text(
-                                        isConnecting
-                                            ? 'ЗАПУСК...'
-                                            : (isConnected ? 'ПОДКЛЮЧЕНО' : 'ОТКЛЮЧЕНО'),
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          fontWeight: FontWeight.w700,
-                                          letterSpacing: 1.2,
-                                          color: isConnected ? accentGreen : Colors.white70,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                        const Spacer(),
-                        _buildTrafficRow(cardDark, isConnected),
-                        const SizedBox(height: 16),
-                        GestureDetector(
-                          onTap: _showNodesListModal,
-                          child: _buildSelectedNodeCard(cardDark, accentGreen),
-                        ),
-                        const SizedBox(height: 12),
-                      ],
-                    ),
-                  ),
-                ),
               );
             }
+          }
+          EOF
 
-            Widget _buildRouteModeSelector(Color cardDark, Color activeColor) {
-              final modes = {
-                RouteMode.rule: 'Умный (RU напрямую)',
-                RouteMode.global: 'Весь трафик',
-                RouteMode.direct: 'Напрямую',
-              };
+          # --- 2. ANDROID MANIFEST: Права системного VPN ---
+          sed -i 's/<application/<uses-permission android:name="android.permission.INTERNET" \/>\n    <uses-permission android:name="android.permission.BIND_VPN_SERVICE" \/>\n    <application/' android/app/src/main/AndroidManifest.xml
+          sed -i 's/<\/application>/<service android:name=".CoreVpnService" android:permission="android.permission.BIND_VPN_SERVICE" android:exported="false"><intent-filter><action android:name="android.net.VpnService" \/><\/intent-filter><\/service><\/application>/' android/app/src/main/AndroidManifest.xml
 
-              return Container(
-                padding: const EdgeInsets.all(4),
-                decoration: BoxDecoration(
-                  color: cardDark,
-                  borderRadius: BorderRadius.circular(14),
-                  border: Border.all(color: Colors.white10),
-                ),
-                child: Row(
-                  children: modes.entries.map((entry) {
-                    final isSelected = selectedRouteMode == entry.key;
-                    return Expanded(
-                      child: GestureDetector(
-                        onTap: () => setState(() => selectedRouteMode = entry.key),
-                        child: AnimatedContainer(
-                          duration: const Duration(milliseconds: 200),
-                          padding: const EdgeInsets.symmetric(vertical: 10),
-                          decoration: BoxDecoration(
-                            color: isSelected ? activeColor.withOpacity(0.2) : Colors.transparent,
-                            borderRadius: BorderRadius.circular(10),
-                            border: isSelected ? Border.all(color: activeColor.withOpacity(0.6)) : null,
-                          ),
-                          child: Text(
-                            entry.value,
-                            textAlign: TextAlign.center,
-                            style: TextStyle(
-                              fontSize: 11,
-                              fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
-                              color: isSelected ? Colors.white : Colors.white54,
-                            ),
-                          ),
-                        ),
-                      ),
-                    );
-                  }).toList(),
-                ),
-              );
-            }
+          # --- 3. KOTLIN КОД: MainActivity (Слушатель команд от Dart) ---
+          cat << 'EOF' > android/app/src/main/kotlin/com/example/happ/MainActivity.kt
+          package com.example.happ
 
-            Widget _buildTrafficRow(Color cardDark, bool connected) {
-              return Row(
-                children: [
-                  Expanded(
-                    child: Container(
-                      padding: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(
-                        color: cardDark,
-                        borderRadius: BorderRadius.circular(16),
-                        border: Border.all(color: Colors.white10),
-                      ),
-                      child: Row(
-                        children: [
-                          const Icon(Icons.arrow_downward_rounded, color: Color(0xFF00E676), size: 22),
-                          const SizedBox(width: 12),
-                          Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Text('СКАЧИВАНИЕ', style: TextStyle(fontSize: 10, color: Colors.white54)),
-                              const SizedBox(height: 4),
-                              Text(
-                                connected ? '14.8 MB/s' : '0 KB/s',
-                                style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white),
-                              ),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Container(
-                      padding: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(
-                        color: cardDark,
-                        borderRadius: BorderRadius.circular(16),
-                        border: Border.all(color: Colors.white10),
-                      ),
-                      child: Row(
-                        children: [
-                          const Icon(Icons.arrow_upward_rounded, color: Color(0xFF3B82F6), size: 22),
-                          const SizedBox(width: 12),
-                          Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Text('ОТДАЧА', style: TextStyle(fontSize: 10, color: Colors.white54)),
-                              const SizedBox(height: 4),
-                              Text(
-                                connected ? '3.2 MB/s' : '0 KB/s',
-                                style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Colors.white),
-                              ),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ],
-              );
-            }
+          import androidx.annotation.NonNull
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+          import android.content.Intent
+          import android.net.VpnService
 
-            Widget _buildSelectedNodeCard(Color cardDark, Color accentGreen) {
-              return Container(
-                padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
-                decoration: BoxDecoration(
-                  color: cardDark,
-                  borderRadius: BorderRadius.circular(18),
-                  border: Border.all(color: Colors.white12),
-                ),
-                child: Row(
-                  children: [
-                    Container(
-                      width: 42,
-                      height: 42,
-                      alignment: Alignment.center,
-                      decoration: BoxDecoration(
-                        color: Colors.white.withOpacity(0.06),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: const Text('⚡', style: TextStyle(fontSize: 22)),
-                    ),
-                    const SizedBox(width: 14),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            activeNode.name,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700, color: Colors.white),
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            '${activeNode.protocol} • ${activeNode.security.toUpperCase()} • ${activeNode.server}:${activeNode.port}',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w600, color: Colors.white54),
-                          ),
-                        ],
-                      ),
-                    ),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                      decoration: BoxDecoration(
-                        color: accentGreen.withOpacity(0.15),
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      child: Text(
-                        '${activeNode.latencyMs} ms',
-                        style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: accentGreen),
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    const Icon(Icons.chevron_right_rounded, color: Colors.white54),
-                  ],
-                ),
-              );
-            }
+          class MainActivity: FlutterActivity() {
+              private val CHANNEL = "com.happ.vpn/engine"
+
+              override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
+                      if (call.method == "startVpn") {
+                          val intent = VpnService.prepare(this)
+                          if (intent != null) {
+                              startActivityForResult(intent, 0)
+                          } else {
+                              startService(Intent(this, CoreVpnService::class.java))
+                          }
+                          result.success(true)
+                      } else if (call.method == "stopVpn") {
+                          startService(Intent(this, CoreVpnService::class.java).setAction("STOP"))
+                          result.success(true)
+                      } else {
+                          result.notImplemented()
+                      }
+                  }
+              }
+              
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == 0 && resultCode == RESULT_OK) {
+                      startService(Intent(this, CoreVpnService::class.java))
+                  }
+              }
+          }
+          EOF
+
+          # --- 4. KOTLIN КОД: CoreVpnService (Создание сетевого интерфейса tun0) ---
+          cat << 'EOF' > android/app/src/main/kotlin/com/example/happ/CoreVpnService.kt
+          package com.example.happ
+
+          import android.net.VpnService
+          import android.content.Intent
+          import android.os.ParcelFileDescriptor
+
+          class CoreVpnService : VpnService() {
+              private var vpnInterface: ParcelFileDescriptor? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == "STOP") {
+                      vpnInterface?.close()
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  
+                  try {
+                      val builder = Builder()
+                      builder.addAddress("172.19.0.1", 30) // Локальный IP туннеля
+                      builder.addRoute("0.0.0.0", 0)       // Перехват всего трафика
+                      builder.addDnsServer("1.1.1.1")
+                      builder.setSession("Happ Tunnel")
+                      
+                      // Исключаем само приложение, чтобы не зациклить трафик
+                      builder.addDisallowedApplication(packageName)
+                      
+                      vpnInterface = builder.establish()
+                  } catch (e: Exception) {
+                      e.printStackTrace()
+                  }
+                  
+                  return START_STICKY
+              }
+              
+              override fun onDestroy() {
+                  super.onDestroy()
+                  vpnInterface?.close()
+              }
           }
           EOF
 
@@ -751,5 +280,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: happ-release-apk
+          name: happ-hardcore-apk
           path: build/app/outputs/flutter-apk/app-release.apk
